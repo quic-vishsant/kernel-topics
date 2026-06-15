@@ -244,29 +244,52 @@ static bool qcom_glink_channel_update_local_state(struct glink_channel *channel,
 
 	switch (old_state) {
 	case GLINK_CHANNEL_CLOSED:
-		if (state != GLINK_CHANNEL_OPENING)
+		if (state != GLINK_CHANNEL_OPENING) {
+			trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+						       channel->lcid, channel->rcid,
+						       old_state, state, true);
 			goto unlock;
+		}
 		break;
 	case GLINK_CHANNEL_OPENING:
 		if (state != GLINK_CHANNEL_OPENED && state != GLINK_CHANNEL_CLOSED &&
-		    state != GLINK_CHANNEL_CLOSING)
+		    state != GLINK_CHANNEL_CLOSING) {
+			trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+						       channel->lcid, channel->rcid,
+						       old_state, state, true);
 			goto unlock;
+		}
 		break;
 	case GLINK_CHANNEL_OPENED:
-		if (state != GLINK_CHANNEL_CLOSING)
+		if (state != GLINK_CHANNEL_CLOSING) {
+			trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+						       channel->lcid, channel->rcid,
+						       old_state, state, true);
 			goto unlock;
+		}
 		break;
 	case GLINK_CHANNEL_CLOSING:
-		if (state != GLINK_CHANNEL_CLOSED)
+		if (state != GLINK_CHANNEL_CLOSED) {
+			trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+						       channel->lcid, channel->rcid,
+						       old_state, state, true);
 			goto unlock;
+		}
 		break;
 	default:
+		trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+					       channel->lcid, channel->rcid,
+					       old_state, state, true);
 		goto unlock;
 	}
 
 	channel->local_state = state;
 	is_fully_closed = (channel->local_state == GLINK_CHANNEL_CLOSED &&
 			   !channel->remote_opened);
+
+	trace_qcom_glink_channel_state(channel->glink->label, channel->name,
+				       channel->lcid, channel->rcid,
+				       old_state, state, false);
 
 unlock:
 	spin_unlock_irqrestore(&channel->state_lock, flags);
@@ -286,6 +309,10 @@ static bool qcom_glink_channel_update_remote_state(struct glink_channel *channel
 	is_fully_closed = (channel->local_state == GLINK_CHANNEL_CLOSED &&
 			   !channel->remote_opened);
 	spin_unlock_irqrestore(&channel->state_lock, flags);
+
+	trace_qcom_glink_channel_info(channel->glink->label, channel->name,
+				      channel->lcid, channel->rcid,
+				      opened ? "Remote opened" : "Remote closed");
 
 	return is_fully_closed;
 }
@@ -1957,9 +1984,14 @@ static void qcom_glink_rx_close(struct qcom_glink *glink, unsigned int rcid)
 	if (is_fully_closed) {
 		reinit_completion(&channel->open_ack);
 		reinit_completion(&channel->open_req);
-		kref_put(&channel->refcount, qcom_glink_channel_release);
 	}
 
+	/*
+	 * Release the alloc/rcids reference. This is the single kref_put that
+	 * balances the kref_get in alloc_channel and mirrors the unconditional
+	 * idr_remove(rcids) above. It must run exactly once per CMD_CLOSE from
+	 * the remote — no second kref_put inside the is_fully_closed block.
+	 */
 	kref_put(&channel->refcount, qcom_glink_channel_release);
 }
 
