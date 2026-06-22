@@ -42,6 +42,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 
 #include "../dmaengine.h"
 #include "../virt-dma.h"
@@ -414,6 +415,7 @@ struct bam_device {
 	u32 ee;
 	bool controlled_remotely;
 	bool powered_remotely;
+	u32 vmid; /* destination VMID for SCM assignment of desc FIFOs, 0 = disabled */
 	u32 active_channels;
 
 	const struct bam_device_data *dev_data;
@@ -577,6 +579,33 @@ static int bam_alloc_chan(struct dma_chan *chan)
 		return -ENOMEM;
 	}
 
+	/*
+	 * On platforms where the BAM is powered remotely and the remote
+	 * processor enforces XPU access control (e.g. Shikra/NAV), the
+	 * descriptor FIFO must be SCM-assigned to the remote VMID. The BAM
+	 * hardware reads the FIFO as an AXI master under the remote EE, so
+	 * without this grant it triggers an XPU violation as soon as the
+	 * first descriptor is enqueued. Assignment is done once per channel
+	 * allocation — TZ does not revoke it on remote-processor crash.
+	 */
+	if (bdev->vmid) {
+		struct qcom_scm_vmperm dst[2] = {
+			{ QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RW },
+			{ bdev->vmid,         QCOM_SCM_PERM_RW },
+		};
+		u64 src = BIT(QCOM_SCM_VMID_HLOS);
+		int ret = qcom_scm_assign_mem(bchan->fifo_phys, BAM_DESC_FIFO_SIZE,
+					      &src, dst, ARRAY_SIZE(dst));
+		if (ret) {
+			dev_err(bdev->dev, "SCM assign fifo chan %u failed: %d\n",
+				bchan->id, ret);
+			dma_free_wc(bdev->dev, BAM_DESC_FIFO_SIZE,
+				    bchan->fifo_virt, bchan->fifo_phys);
+			bchan->fifo_virt = NULL;
+			return ret;
+		}
+	}
+
 	if (bdev->active_channels++ == 0 && bdev->powered_remotely)
 		bam_reset(bdev);
 
@@ -608,27 +637,37 @@ static void bam_free_chan(struct dma_chan *chan)
 		goto err;
 	}
 
-	scoped_guard(spinlock_irqsave, &bchan->vc.lock)
-		bam_reset_channel(bchan);
+	/*
+	 * When the BAM is powered remotely (e.g. by the modem), the remote
+	 * side may have already removed power by the time the channel is
+	 * released. Skip all register accesses to avoid synchronous external
+	 * aborts. The FIFO memory is still freed below.
+	 */
+	if (!bdev->powered_remotely) {
+		scoped_guard(spinlock_irqsave, &bchan->vc.lock)
+			bam_reset_channel(bchan);
+
+		/* mask irq for pipe/channel */
+		val = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
+		val &= ~BIT(bchan->id);
+		writel_relaxed(val, bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
+
+		/* disable irq */
+		writel_relaxed(0, bam_addr(bdev, bchan->id, BAM_P_IRQ_EN));
+
+		if (--bdev->active_channels == 0) {
+			/* s/w reset bam */
+			val = readl_relaxed(bam_addr(bdev, 0, BAM_CTRL));
+			val |= BAM_SW_RST;
+			writel_relaxed(val, bam_addr(bdev, 0, BAM_CTRL));
+		}
+	} else {
+		--bdev->active_channels;
+	}
 
 	dma_free_wc(bdev->dev, BAM_DESC_FIFO_SIZE, bchan->fifo_virt,
 		    bchan->fifo_phys);
 	bchan->fifo_virt = NULL;
-
-	/* mask irq for pipe/channel */
-	val = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
-	val &= ~BIT(bchan->id);
-	writel_relaxed(val, bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
-
-	/* disable irq */
-	writel_relaxed(0, bam_addr(bdev, bchan->id, BAM_P_IRQ_EN));
-
-	if (--bdev->active_channels == 0 && bdev->powered_remotely) {
-		/* s/w reset bam */
-		val = readl_relaxed(bam_addr(bdev, 0, BAM_CTRL));
-		val |= BAM_SW_RST;
-		writel_relaxed(val, bam_addr(bdev, 0, BAM_CTRL));
-	}
 
 err:
 	pm_runtime_mark_last_busy(bdev->dev);
@@ -788,7 +827,15 @@ static int bam_dma_terminate_all(struct dma_chan *chan)
 		if (!list_empty(&bchan->desc_list)) {
 			async_desc = list_first_entry(&bchan->desc_list,
 						      struct bam_async_desc, desc_node);
-			bam_chan_init_hw(bchan, async_desc->dir);
+			/*
+			 * Skip the hardware reset when the BAM is powered
+			 * remotely (e.g. by the modem). The remote side may
+			 * have already removed power by the time terminate_all
+			 * is called, and writing to BAM pipe registers with no
+			 * power causes an SError.
+			 */
+			if (!bchan->bdev->powered_remotely)
+					bam_chan_init_hw(bchan, async_desc->dir);
 		}
 
 		list_for_each_entry_safe(async_desc, tmp,
@@ -1301,6 +1348,9 @@ static int bam_dma_probe(struct platform_device *pdev)
 						"qcom,controlled-remotely");
 	bdev->powered_remotely = of_property_read_bool(pdev->dev.of_node,
 						"qcom,powered-remotely");
+
+	/* Optional: VMID for SCM-assigning descriptor FIFOs to the remote processor */
+	of_property_read_u32(pdev->dev.of_node, "qcom,vmid", &bdev->vmid);
 
 	if (bdev->controlled_remotely || bdev->powered_remotely)
 		bdev->bamclk = devm_clk_get_optional(bdev->dev, "bam_clk");
